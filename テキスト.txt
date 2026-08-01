@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>MQO to GLB Object Bone Converter</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: sans-serif; background: #222; color: #fff; touch-action: none; }
+        #ui { position: absolute; top: 10px; left: 10px; z-index: 10; background: rgba(0,0,0,0.8); padding: 12px; border-radius: 8px; max-width: 90%; }
+        #fileInput { font-size: 16px; margin: 10px 0; width: 100%; }
+        canvas { display: block; }
+        #logConsole { position: absolute; bottom: 0; left: 0; width: 100%; max-height: 120px; overflow-y: auto; background: rgba(0,0,0,0.9); color: #ff5555; font-family: monospace; font-size: 12px; padding: 10px; box-sizing: border-box; border-top: 2px solid #555; pointer-events: auto; user-select: text; -webkit-user-select: text; }
+        .btn { background: #444; color: #fff; border: 1px solid #666; padding: 8px 12px; border-radius: 4px; font-size: 13px; cursor: pointer; margin-right: 5px; font-weight: bold; margin-bottom: 5px; }
+        #exportBtn { background: #28a745; border-color: #218838; display: inline-block; } 
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <h3 style="margin:0 0 5px 0; font-size:16px;">MQO ➔ 個別パーツ保持 GLB変換器</h3>
+        <input type="file" id="fileInput" accept=".mqo">
+        <div id="status" style="font-size:13px; color:#aaa; margin-bottom:8px;">.mqoファイルを選択してください</div>
+        <button class="btn" id="exportBtn">ボーン付きGLBをダウンロード</button>
+        <button class="btn" id="copyLogBtn">ログをコピー</button>
+    </div>
+
+    <div id="logConsole">【システムログ】</div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+
+        function showLog(message, isError = true) {
+            const consoleDiv = document.getElementById('logConsole');
+            consoleDiv.style.color = isError ? '#ff5555' : '#55ff55';
+            consoleDiv.innerHTML += `<br>${isError ? '❌ [ERROR]' : 'ℹ️ [INFO]'} ${message}`;
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        }
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 5, 20);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 20, 15);
+        scene.add(dirLight);
+
+        let currentRoot = null;
+        let loadedFileName = "model";
+
+        document.getElementById('fileInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            loadedFileName = file.name.replace(/\.[^/.]+$/, ""); 
+            document.getElementById('status').textContent = "オブジェクトボーンを解析中...";
+            document.getElementById('logConsole').innerHTML = "【システムログ】";
+
+            const reader = new FileReader();
+            reader.readAsText(file, 'UTF-8'); 
+
+            reader.onload = function(event) {
+                let text = event.target.result;
+                if (!text.includes("Metasequoia")) {
+                    const reReader = new FileReader();
+                    reReader.readAsText(file, 'Shift_JIS');
+                    reReader.onload = function(ev) { tryLoop(ev.target.result); };
+                } else {
+                    tryLoop(text);
+                }
+            };
+        });
+
+        function tryLoop(text) {
+            try {
+                buildModelFromMQO(text);
+                document.getElementById('status').textContent = "パーツとボーン構造を別々に保持して表示中！";
+            } catch(err) {
+                showLog(`${err.message}`);
+                document.getElementById('status').textContent = "解析エラー発生";
+            }
+        }
+
+        function buildModelFromMQO(text) {
+            if (currentRoot) scene.remove(currentRoot);
+
+            const tokens = text.match(/"[^"]*"|V\([^)]+\)|[{}()\[\]]|\S+/g);
+            if (!tokens) throw new Error("トークン分解に失敗しました。");
+
+            let objects = [];
+            let currentObj = null;
+
+            // 1. すべてのオブジェクト（メッシュデータ）を構造化
+            for (let i = 0; i < tokens.length; i++) {
+                const token = tokens[i];
+                if (token === "Object") {
+                    let rawName = tokens[i+1] || `"Object_${objects.length}"`;
+                    currentObj = {
+                        name: rawName.replace(/"/g, ""),
+                        vertices: [],
+                        faces: []
+                    };
+                    objects.push(currentObj);
+                    continue;
+                }
+
+                if (!currentObj) continue;
+
+                if (token === "vertex") {
+                    let j = i + 2;
+                    if (tokens[j] === "{") j++;
+                    while (j < tokens.length && tokens[j] !== "}") {
+                        const val = Number(tokens[j]);
+                        if (!isNaN(val)) currentObj.vertices.push(val);
+                        j++;
+                    }
+                    i = j;
+                    continue;
+                }
+
+                if (token === "face") {
+                    let j = i + 2;
+                    if (tokens[j] === "{") j++;
+                    while (j < tokens.length && tokens[j] !== "}") {
+                        const faceToken = tokens[j];
+                        const vMatch = faceToken.match(/V\(\s*([\d\s]+)\s*\)/);
+                        if (vMatch) {
+                            const localIndices = vMatch[1].trim().split(/\s+/).map(Number);
+                            currentObj.faces.push(localIndices);
+                        }
+                        j++;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+
+            // 2. ボーンオブジェクトと通常メッシュの分離
+            let boneObjects = objects.filter(obj => obj.name.toLowerCase().startsWith("bone:"));
+            let meshObjects = objects.filter(obj => !obj.name.toLowerCase().startsWith("bone:"));
+
+            let threeBones = [];
+            let boneGlobalPositions = []; // 各ボーンの世界座標を一時保持
+
+            if (boneObjects.length > 0) {
+                showLog(`オブジェクト型ボーンを ${boneObjects.length} 個検出しました。`, false);
+                boneObjects.forEach((bo) => {
+                    let bone = new THREE.Bone();
+                    bone.name = bo.name;
+                    
+                    let sumX = 0, sumY = 0, sumZ = 0;
+                    let vCount = bo.vertices.length / 3;
+                    let pos = new THREE.Vector3(0, 0, 0);
+                    if (vCount > 0) {
+                        for (let k = 0; k < bo.vertices.length; k += 3) {
+                            sumX += bo.vertices[k];
+                            sumY += bo.vertices[k+1];
+                            sumZ += bo.vertices[k+2];
+                        }
+                        pos.set(sumX / vCount, sumY / vCount, sumZ / vCount);
+                    }
+                    // 最初は世界座標として位置を設定
+                    bone.position.copy(pos);
+                    threeBones.push(bone);
+                    boneGlobalPositions.push(pos.clone()); // 距離判定用にキープ
+                });
+            } else {
+                showLog("bone: プレフィックスの付いたオブジェクトが見つかりません。ダミーを生成します。", true);
+                let dummyBone = new THREE.Bone();
+                dummyBone.name = "root_bone";
+                dummyBone.position.set(0,0,0);
+                threeBones.push(dummyBone);
+                boneGlobalPositions.push(new THREE.Vector3(0,0,0));
+            }
+
+            // 全体をまとめるルートコンテナ
+            const modelGroup = new THREE.Group();
+            modelGroup.name = loadedFileName;
+
+            // 3. 各オブジェクトを「完全に独立したSkinnedMesh」として構築（ウェイト計算は世界座標で行う）
+            let validMeshCount = 0;
+
+            meshObjects.forEach(mo => {
+                let renderPositions = [];
+                let skinIndices = [];
+                let skinWeights = [];
+
+                for (let f = 0; f < mo.faces.length; f++) {
+                    const indices = mo.faces[f];
+                    
+                    const addVertex = (localIdx) => {
+                        let stride = localIdx * 3;
+                        if (stride >= mo.vertices.length || stride < 0) return;
+                        
+                        let vx = mo.vertices[stride];
+                        let vy = mo.vertices[stride+1];
+                        let vz = mo.vertices[stride+2];
+                        
+                        renderPositions.push(vx, vy, vz);
+
+                        // 正しい世界座標での最寄りボーン探索
+                        let closestBoneIdx = 0;
+                        let minDist = Infinity;
+                        boneGlobalPositions.forEach((bPos, bIdx) => {
+                            let dist = Math.hypot(vx - bPos.x, vy - bPos.y, vz - bPos.z);
+                            if (dist < minDist) {
+                                minDist = dist;
+                                closestBoneIdx = bIdx;
+                            }
+                        });
+
+                        skinIndices.push(closestBoneIdx, 0, 0, 0);
+                        skinWeights.push(1.0, 0.0, 0.0, 0.0);
+                    };
+
+                    if (indices.length === 3) {
+                        addVertex(indices[0]); addVertex(indices[1]); addVertex(indices[2]);
+                    } else if (indices.length === 4) {
+                        addVertex(indices[0]); addVertex(indices[1]); addVertex(indices[2]);
+                        addVertex(indices[0]); addVertex(indices[2]); addVertex(indices[3]);
+                    }
+                }
+
+                if (renderPositions.length === 0) return; 
+
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(renderPositions, 3));
+                geometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndices, 4));
+                geometry.setAttribute('skinWeight', new THREE.Float32BufferAttribute(skinWeights, 4));
+                geometry.computeVertexNormals();
+
+                const material = new THREE.MeshStandardMaterial({
+                    color: 0x33aa66,
+                    roughness: 0.4,
+                    metalness: 0.1,
+                    side: THREE.DoubleSide
+                });
+
+                const sMesh = new THREE.SkinnedMesh(geometry, material);
+                sMesh.name = mo.name; // MQOの個別のパーツ名を完全に維持
+                
+                // 共通Skeletonは、親子化する「前」のボーン配列で一度作成してバインドする
+                const skeleton = new THREE.Skeleton(threeBones);
+                sMesh.bind(skeleton); 
+                
+                modelGroup.add(sMesh);
+                validMeshCount++;
+            });
+
+            if (validMeshCount === 0) throw new Error("描画可能なメッシュデータがありません。");
+
+            // 4. 最後にボーンの親子関係（フラットな階層）を構築
+            // ※ addするとローカル座標に変換されるため、親（threeBones[0]）からの相対座標に変換して差し替える
+            const rootBone = threeBones[0];
+            for (let k = 1; k < threeBones.length; k++) {
+                threeBones[k].position.sub(rootBone.position);
+                rootBone.add(threeBones[k]);
+            }
+            
+            // ルートボーン自身をモデルグループに追加
+            modelGroup.add(rootBone);
+
+            // 座標のズレを防ぐため、全体センタリングの強制移動処理は撤廃（MQOの原点・位置関係を100%維持）
+            scene.add(modelGroup);
+            currentRoot = modelGroup;
+
+            // カメラの視点を読み込んだモデルに合わせる処理
+            const box = new THREE.Box3().setFromObject(modelGroup);
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            controls.target.copy(center);
+
+            showLog(`パーツ結合なしで準備完了。総パーツ数(Mesh): ${validMeshCount}, 総ボーン数: ${threeBones.length}`, false);
+        }
+
+        // --- GLBエクスポート処理 ---
+        document.getElementById('exportBtn').addEventListener('click', () => {
+            if (!currentRoot) return;
+
+            showLog("個別パーツを保持したままGLBへ変換中...", false);
+            const exporter = new GLTFExporter();
+            const options = { binary: true, includeCustomExtensions: true };
+
+            exporter.parse(currentRoot, function(result) {
+                const blob = new Blob([result], { type: 'application/octet-stream' });
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(blob);
+                link.download = `${loadedFileName}_separated.glb`;
+                link.click();
+                showLog(`変換成功: ${loadedFileName}_separated.glb`, false);
+            }, function(error) {
+                showLog(`変換エラー: ${error.message}`);
+            }, options);
+        });
+
+        document.getElementById('copyLogBtn').addEventListener('click', () => {
+            navigator.clipboard.writeText(document.getElementById('logConsole').innerText);
+            alert('ログをコピーしました');
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
